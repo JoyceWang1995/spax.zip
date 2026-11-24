@@ -1,243 +1,366 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { ChevronDown, ArrowUpRight, ArrowRight, Plus, Minus, Play, Pause, ClipboardList, PenLine, MessageCircle, X, Check, Mic, Camera, StickyNote, MapPin, Square, LayoutGrid } from 'lucide-react'
+import {
+  ArrowRight, Plus, Play, Pause, X, Check, Mic, Camera, StickyNote, MapPin, Square, LayoutGrid, Pencil, Trash2,
+  ListChecks, MessageSquare, Layers, Shirt, User, Package, Wrench, Contact, Sparkles,
+  ConciergeBell, Sofa, Dumbbell, BedSingle, Waves, Flame, CloudFog, Snowflake, Coffee, Archive, ShoppingBag, Users,
+} from 'lucide-react'
 import { Page, useRole } from '../../components/Shell'
 import { Avatar, AvatarStack, Bar, ringColor } from '../../components/ui'
 import TaskEditor from '../../components/TaskEditor'
-import { TaskChip, tagLabel } from './Rooms'
-import { useStore, STAFF_PINS, STAFF, staffById, roomSummary, taskStats } from '../../data/store'
+import { FormModal } from '../../components/Overlays'
+import { TaskChip, tagLabel, StatusLine } from './Rooms'
+import { useStore, STAFF_PINS, STAFF, staffById, roomSummary, taskStats, PLAN_COLS, PLAN_ROWS, blockFits, freeCell, TASK_STATUS, fmtTime } from '../../data/store'
 import { img } from '../../data/assets'
 
+/*
+ * Customisable spa plan: each LG room is a block on a 6 × 4 grid. Clients build their own layout —
+ * add blocks, drag to move, drag the corner to resize, rename or remove — instead of uploading a floor plan.
+ * Blocks show RFID stock (towels, items…), task status pins, staff and notes; a block = a room on the Location page.
+ */
+const CONT = { x: 80, y: 196, w: 992, h: 640 }               // the glass panel holding the plan
+const GRID = { x: 92, y: 210, w: 968, h: 540, gap: 8 }        // the block grid inside it
+const COL = (GRID.w - (PLAN_COLS - 1) * GRID.gap) / PLAN_COLS
+const ROW = (GRID.h - (PLAN_ROWS - 1) * GRID.gap) / PLAN_ROWS
+const rectOf = b => ({
+  left: GRID.x + b.c * (COL + GRID.gap), top: GRID.y + b.r * (ROW + GRID.gap),
+  width: b.w * COL + (b.w - 1) * GRID.gap, height: b.h * ROW + (b.h - 1) * GRID.gap,
+})
+
 const STATUS_COLOR = { overdue: '#d8321f', soon: '#e3b02b', ontrack: '#0f8a76' }
-const PLAN_W = 2260, PLAN_H = 2138 // floorplan.webp pixels
-const BASE = 0.5                   // plan pixels → canvas pixels at 100%
-const START = { x: 70, y: 86 }     // where the plan's top-left sits at 100%
-const FOCUS = { x: 560, y: 500 }   // zoom anchor for the +/- buttons (centre of the open map area)
+const LAYERS = [
+  { k: 'tasks', label: 'Tasks', icon: ListChecks },
+  { k: 'comments', label: 'Comments', icon: MessageSquare },
+  { k: 'towels', label: 'Towels', icon: Layers, unit: 'towels' },
+  { k: 'robes', label: 'Robes', icon: Shirt, unit: 'robes' },
+  { k: 'guests', label: 'Guests', icon: User, unit: 'guests' },
+  { k: 'products', label: 'Products', icon: Package, unit: 'items' },
+  { k: 'equipment', label: 'Equipment', icon: Wrench, unit: 'equipment' },
+  { k: 'staff', label: 'Staff', icon: Contact },
+]
+const ROOM_ICON = { reception: ConciergeBell, relax: Sofa, gym: Dumbbell, hydro: Waves, thermal: Flame, steam: CloudFog, ice: Snowflake, cafe: Coffee, linen: Archive, retail: ShoppingBag, boh: Users }
+const TYPE_ICON = { treatment: BedSingle, wellness: Waves, fitness: Dumbbell, reception: ConciergeBell, boh: Archive }
+const iconFor = room => ROOM_ICON[room.id] || TYPE_ICON[room.type] || LayoutGrid
+const TYPES = [['Treatment', 'treatment'], ['Wellness', 'wellness'], ['Fitness', 'fitness'], ['Reception', 'reception'], ['Back of house', 'boh']]
+const SIZES = { '1 × 1': [1, 1], '2 × 1': [2, 1], '1 × 2': [1, 2], '2 × 2': [2, 2] }
+
+const countOf = v => (Array.isArray(v) ? v[0] : v) || 0
+const level = v => { if (!Array.isArray(v)) return 'ok'; const q = v[0] / v[1]; return q < 0.35 ? 'low' : q < 0.6 ? 'mid' : 'ok' }
 
 /** Status of a room on the map — derived from the same tasks the Location page shows */
 export function roomStatus(room, tasks) {
   const sum = roomSummary(room, tasks)
+  const open = sum.list.filter(t => t.status !== 'done')
   const status = sum.overdue ? 'overdue' : sum.list.some(t => t.status === 'soon') ? 'soon' : 'ontrack'
-  return { status, sum }
+  return { status, sum, open: open.length }
 }
 
 export default function FloorMap() {
   const role = useRole()
   const nav = useNavigate()
   const [params] = useSearchParams()
-  const { tasks, rooms, notes, dispatch, notify, setAssistantOpen } = useStore()
-  const [filters, setFilters] = useState({ overdue: true, soon: true, ontrack: true })
-  const [showStaff, setShowStaff] = useState(true)
-  const [floor, setFloor] = useState('LG')
-  const [menu, setMenu] = useState(null)
-  const [view, setView] = useState({ z: 1, x: START.x, y: START.y })
-  const [dragging, setDragging] = useState(false)
-  const [sel, setSel] = useState(role === 'manager' ? 'hydro' : null)
-  const [placing, setPlacing] = useState(false)   // "drop a pin" mode for a new note
-  const [draft, setDraft] = useState(null)        // { x, y } of a dropped pin waiting for its note
+  const { tasks, rooms, notes, dispatch, notify, setAssignOpen } = useStore()
+  const [layers, setLayers] = useState({ tasks: true, comments: true, towels: true, robes: false, guests: false, products: true, equipment: false, staff: true })
+  const [sel, setSel] = useState(params.get('room') || (role === 'manager' ? 'hydro' : null))
+  const [hover, setHover] = useState(null)       // room whose pulsing blip is hovered
+  const [editing, setEditing] = useState(false)
+  const [drag, setDrag] = useState(null)          // { id, block, valid } while moving / resizing in edit mode
+  const [placing, setPlacing] = useState(false)   // dropping a note pin
+  const [draft, setDraft] = useState(null)        // { room, fx, fy } waiting for its note
   const [openNote, setOpenNote] = useState(null)
   const [editor, setEditor] = useState(null)
-  const drag = useRef(null)
-  const justDragged = useRef(false)
-  const layer = useRef(null)
+  const [modal, setModal] = useState(null)        // 'add' | { rename: room }
+  const [restockDone, setRestockDone] = useState(false)
+  const dragRef = useRef(null)
 
-  // one pin per LG room — the same rooms and tasks as the Location page
-  const pins = useMemo(() => rooms.filter(r => r.floor === 'LG' && r.pin).map(room => ({ room, x: room.pin.x, y: room.pin.y, ...roomStatus(room, tasks) })), [rooms, tasks])
-  const selPin = pins.find(p => p.room.id === sel)
+  const plan = rooms.filter(r => r.floor === 'LG' && r.block)
+  const info = useMemo(() => Object.fromEntries(plan.map(r => [r.id, roomStatus(r, tasks)])), [plan, tasks])
+  const selRoom = plan.find(r => r.id === sel)
+  const totals = Object.fromEntries(LAYERS.map(l => [l.k, l.k === 'staff' ? STAFF_PINS.length : plan.reduce((n, r) => n + countOf(r.stock?.[l.k]), 0)]))
   const stats = taskStats(role === 'manager' ? tasks : tasks.filter(t => t.people.includes('amy')))
   const base = role === 'manager' ? { done: 37, all: 33 } : { done: 3, all: 8 }
   const done = stats.done + base.done, all = stats.all + base.all
-  const attention = pins.filter(p => p.status === 'overdue')
+  const addSlot = role === 'manager' ? freeCell(plan) : null
 
-  /* ── pan & zoom ── the plan fills the whole canvas; everything else floats over it */
-  const k = BASE * view.z
-  const at = (px, py) => ({ left: view.x + px * k, top: view.y + py * k })
-  const clamp = v => {
-    const w = PLAN_W * BASE * v.z, h = PLAN_H * BASE * v.z, m = 220
-    return { ...v, x: Math.min(1552 - m, Math.max(m - w, v.x)), y: Math.min(872 - m, Math.max(m - h, v.y)) }
-  }
-  const zoomTo = (z, ax = FOCUS.x, ay = FOCUS.y) => setView(v => {
-    const nz = Math.min(2.5, Math.max(0.6, z)), r = nz / v.z
-    return clamp({ z: nz, x: ax - (ax - v.x) * r, y: ay - (ay - v.y) * r })
-  })
-  const toStage = (cx, cy) => {
-    const r = layer.current.getBoundingClientRect(), sc = r.width / 1552
-    return { x: (cx - r.left) / sc, y: (cy - r.top) / sc, sc }
-  }
-  const onDown = e => {
-    if (e.button !== 0) return
-    if (e.target === layer.current) e.preventDefault() // no text/image selection while dragging
-    justDragged.current = false
-    drag.current = { sx: e.clientX, sy: e.clientY, vx: view.x, vy: view.y, id: e.pointerId }
-  }
-  const onMove = e => {
-    const d = drag.current
-    if (!d) return
-    const { sc } = toStage(0, 0)
-    const dx = (e.clientX - d.sx) / sc, dy = (e.clientY - d.sy) / sc
-    if (!justDragged.current) {
-      if (Math.abs(dx) + Math.abs(dy) < 5) return
-      justDragged.current = true
-      setDragging(true)
-      layer.current.setPointerCapture?.(d.id)
-    }
-    setView(v => clamp({ ...v, x: d.vx + dx, y: d.vy + dy }))
-  }
-  const onUp = e => {
-    const wasDrag = justDragged.current
-    drag.current = null
-    setDragging(false)
-    // a tap (not a drag) on the plan while in pin mode drops the note pin there
-    if (placing && !wasDrag && e.target === layer.current) {
-      const p = toStage(e.clientX, e.clientY)
-      const x = Math.round((p.x - view.x) / k), y = Math.round((p.y - view.y) / k)
-      if (x < 0 || y < 0 || x > PLAN_W || y > PLAN_H) return notify('Drop the pin inside the floor plan')
-      setDraft({ x, y }); setPlacing(false)
-    }
-  }
-  const onWheel = e => {
-    const p = toStage(e.clientX, e.clientY)
-    zoomTo(view.z * (1 - e.deltaY * 0.0015), p.x, p.y)
-  }
-  const focusPin = (p) => {
-    setSel(p.room.id)
-    setView(v => { const z = Math.max(v.z, 1.3); return clamp({ z, x: FOCUS.x - p.x * BASE * z, y: FOCUS.y - p.y * BASE * z }) })
-  }
-  // arriving from a room card ("Show on floor map") focuses that room
-  useEffect(() => {
-    const id = params.get('room')
-    const p = id && pins.find(x => x.room.id === id)
-    if (p) { setFilters({ overdue: true, soon: true, ontrack: true }); focusPin(p) }
-  }, [params.get('room')]) // eslint-disable-line
+  // arriving from a room card ("Show on floor map") selects that block
+  useEffect(() => { const id = params.get('room'); if (id) setSel(id) }, [params.get('room')]) // eslint-disable-line
 
-  const nearestRoom = (x, y) => pins.reduce((best, p) => {
-    const d = Math.hypot(p.x - x, p.y - y)
-    return d < best.d ? { d, room: p.room } : best
-  }, { d: Infinity, room: null }).room
-  const ease = dragging ? 'none' : 'left .45s cubic-bezier(.2,.8,.2,1), top .45s cubic-bezier(.2,.8,.2,1), width .45s cubic-bezier(.2,.8,.2,1), height .45s cubic-bezier(.2,.8,.2,1)'
-  const tap = fn => () => { if (!justDragged.current && !placing) fn() }
-  const startPlacing = () => { setPlacing(true); setSel(null); setMenu(null) }
+  // Predictive restock: the stocked item furthest below par
+  const restock = useMemo(() => {
+    let worst = null
+    plan.forEach(r => ['towels', 'robes', 'products'].forEach(k => {
+      const v = r.stock?.[k]
+      if (Array.isArray(v) && v[0] / v[1] < 0.35 && (!worst || v[0] / v[1] < worst.q)) worst = { room: r, k, n: v[0], par: v[1], q: v[0] / v[1] }
+    }))
+    if (!worst) return null
+    const src = plan.find(r => r.id !== worst.room.id && Array.isArray(r.stock?.[worst.k]) && r.stock[worst.k][0] > worst.par)
+    return { ...worst, src }
+  }, [plan])
+
+  /* ── edit mode: drag a block to move it, drag its corner to resize ── */
+  const scale = () => document.querySelector('.stage').getBoundingClientRect().width / 1552
+  const startDrag = (e, room, mode) => {
+    if (!editing) return
+    e.preventDefault(); e.stopPropagation()
+    dragRef.current = { id: room.id, mode, x: e.clientX, y: e.clientY, start: room.block, moved: false }
+    const move = ev => {
+      const d = dragRef.current, k = scale()
+      const dc = Math.round((ev.clientX - d.x) / k / (COL + GRID.gap)), dr = Math.round((ev.clientY - d.y) / k / (ROW + GRID.gap))
+      if (dc || dr) d.moved = true
+      const b = d.mode === 'move'
+        ? { ...d.start, c: d.start.c + dc, r: d.start.r + dr }
+        : { ...d.start, w: Math.max(1, d.start.w + dc), h: Math.max(1, d.start.h + dr) }
+      setDrag({ id: d.id, block: b, valid: blockFits(rooms, b, d.id) })
+    }
+    const up = () => {
+      window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up)
+      setDrag(cur => {
+        if (cur && cur.valid) dispatch({ type: 'updateRoom', room: { id: cur.id, block: cur.block } })
+        else if (cur && dragRef.current?.moved) notify('That space is taken — blocks can’t overlap')
+        return null
+      })
+      if (!dragRef.current?.moved) setSel(room.id)
+      dragRef.current = null
+    }
+    window.addEventListener('pointermove', move); window.addEventListener('pointerup', up)
+  }
+
+  const onBlockClick = (e, room) => {
+    if (editing) return
+    if (placing) {
+      const r = e.currentTarget.getBoundingClientRect()
+      setDraft({ room: room.id, where: room.name, fx: (e.clientX - r.left) / r.width, fy: (e.clientY - r.top) / r.height })
+      setPlacing(false)
+      return
+    }
+    setSel(room.id)
+  }
   const editTask = t => setEditor({ mode: 'edit', task: t, room: rooms.find(r => r.id === t.room) })
+  const removeBlock = room => {
+    const open = info[room.id]?.open || 0
+    if (open) return notify(`${room.name} still has ${open} open task${open > 1 ? 's' : ''} — finish or move them first`)
+    dispatch({ type: 'removeRoom', id: room.id }); setSel(null); notify(`${room.name} removed from the plan`)
+  }
+  const createRestock = () => {
+    const { room, k } = restock
+    dispatch({ type: 'addTask', task: { id: 't-' + Date.now(), title: `Restock ${k}`, room: room.id, location: room.name, due: '12:30', status: 'soon', people: [] } })
+    setRestockDone(true)
+    setAssignOpen(true)
+  }
 
-  const mapLayer = (
-    <div ref={layer} className="abs" style={{ inset: 0, overflow: 'hidden', cursor: placing ? 'crosshair' : dragging ? 'grabbing' : 'grab', touchAction: 'none', userSelect: 'none', WebkitUserSelect: 'none' }}
-      onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={() => { drag.current = null; setDragging(false) }} onWheel={onWheel}>
-      <img src={img.floorplan} alt="Lower ground floor plan" draggable={false}
-        style={{ position: 'absolute', ...at(0, 0), width: PLAN_W * k, height: PLAN_H * k, transition: ease, userSelect: 'none', pointerEvents: 'none',
-          filter: floor === 'LG' ? 'drop-shadow(0 30px 40px rgba(0,25,30,.35))' : 'grayscale(1) blur(3px) opacity(.45)' }} />
-
-      {floor === 'LG' && showStaff && STAFF_PINS.map(p => {
-        const s = staffById[p.staff], pos = at(p.x, p.y)
-        return (
-          <div key={p.staff} title={`${s.name} · ${s.note}`} style={{ position: 'absolute', left: pos.left - 19, top: pos.top - 44, transition: ease, filter: 'drop-shadow(0 4px 6px rgba(0,0,0,.3))', pointerEvents: placing ? 'none' : 'auto' }}>
-            <div style={{ position: 'absolute', left: 13, top: 30, width: 12, height: 12, background: ringColor(s.status), transform: 'rotate(45deg)', borderRadius: 2 }} />
-            <Avatar id={p.staff} size={38} style={{ border: `3px solid ${ringColor(s.status)}`, position: 'relative' }} />
-          </div>
-        )
-      })}
-
-      {floor === 'LG' && pins.map(p => {
-        if (!filters[p.status]) return null
-        const c = STATUS_COLOR[p.status], pos = at(p.x, p.y), on = sel === p.room.id
-        return (
-          <div key={p.room.id} style={{ position: 'absolute', left: pos.left - 23, top: pos.top - 23, transition: ease, pointerEvents: placing ? 'none' : 'auto' }}>
-            <button onClick={tap(() => setSel(on ? null : p.room.id))} title={p.room.name}
-              style={{ position: 'relative', width: 46, height: 46, borderRadius: '50%', background: `${c}55`, display: 'grid', placeItems: 'center' }}>
-              {p.status === 'overdue' && <span style={{ position: 'absolute', inset: 0, borderRadius: '50%', background: `${c}44`, animation: 'ping 2s ease-out infinite' }} />}
-              <span style={{ width: 28, height: 28, borderRadius: '50%', background: c, color: '#fff', fontSize: 11, display: 'grid', placeItems: 'center', boxShadow: on ? '0 0 0 3px #fff' : 'none' }}>
-                !
-              </span>
+  const plan2 = plan.map(r => (drag?.id === r.id ? { ...r, block: drag.block } : r))
+  return (
+    <Page view="map" bg="dark" nav={false}>
+      {/* layer chips — tasks, comments and RFID-tagged items */}
+      <div className="abs" style={{ left: CONT.x, top: 144, display: 'flex', gap: 6, zIndex: 12 }}>
+        {LAYERS.map(l => {
+          const on = layers[l.k], I = l.icon
+          return (
+            <button key={l.k} onClick={() => setLayers(x => ({ ...x, [l.k]: !x[l.k] }))} className="chip float"
+              title={`${on ? 'Hide' : 'Show'} ${l.label.toLowerCase()} on the plan`}
+              style={{ height: 34, padding: '0 13px', fontSize: 12, gap: 6, background: on ? 'rgba(255,255,255,.28)' : 'rgba(255,255,255,.08)', color: on ? '#fff' : 'rgba(255,255,255,.65)', transition: 'background .2s' }}>
+              <I size={13} />{l.label}{!['tasks', 'comments'].includes(l.k) && <span style={{ opacity: .55, fontSize: 10.5 }}>{totals[l.k]}</span>}
             </button>
-            {(on || view.z >= 1.4) && (
-              <span className="chip float" style={{ position: 'absolute', top: 48, left: '50%', transform: 'translateX(-50%)', height: 20, fontSize: 9.5, background: 'rgba(12,45,50,.6)', pointerEvents: 'none' }}>{p.room.name}</span>
+          )
+        })}
+      </div>
+      {role === 'manager' && (
+        <button className="chip float abs" onClick={() => { setEditing(e => !e); setPlacing(false) }}
+          style={{ left: CONT.x + CONT.w - 116, top: 144, width: 116, height: 34, justifyContent: 'center', fontSize: 12, gap: 6, zIndex: 12,
+            background: editing ? 'var(--teal)' : 'rgba(255,255,255,.14)', color: '#fff' }}>
+          {editing ? <><Check size={13} /> Done</> : <><Pencil size={13} /> Edit plan</>}
+        </button>
+      )}
+
+      {/* the plan */}
+      <div className="glass abs" style={{ left: CONT.x, top: CONT.y, width: CONT.w, height: CONT.h, borderRadius: 30, background: 'rgba(255,255,255,.06)' }} />
+      {editing && (
+        <div className="abs fade" style={{ left: GRID.x, top: GRID.y, width: GRID.w, height: GRID.h, pointerEvents: 'none' }}>
+          {Array.from({ length: PLAN_COLS * PLAN_ROWS }, (_, i) => {
+            const rc = rectOf({ c: i % PLAN_COLS, r: Math.floor(i / PLAN_COLS), w: 1, h: 1 })
+            return <div key={i} style={{ position: 'absolute', left: rc.left - GRID.x, top: rc.top - GRID.y, width: rc.width, height: rc.height, borderRadius: 16, border: '1px dashed rgba(255,255,255,.14)' }} />
+          })}
+        </div>
+      )}
+
+      {plan2.map(room => {
+        const rc = rectOf(room.block)
+        const st = info[room.id] || { status: 'ontrack', open: 0, sum: { list: [] } }
+        const on = sel === room.id
+        const dragging = drag?.id === room.id
+        const I = iconFor(room)
+        const chips = LAYERS.filter(l => l.unit && layers[l.k] && room.stock?.[l.k] != null).slice(0, room.block.h > 1 ? 4 : 2)
+        const roomNotes = notes.filter(n => n.room === room.id)
+        return (
+          <div key={room.id} className="abs" onClick={e => onBlockClick(e, room)} onPointerDown={e => startDrag(e, room, 'move')}
+            title={editing ? 'Drag to move · drag the corner to resize' : placing ? `Drop your note in ${room.name}` : room.name}
+            style={{ ...rc, borderRadius: 18, zIndex: dragging ? 9 : on ? 3 : 2,
+              background: on ? 'rgba(255,255,255,.15)' : 'rgba(255,255,255,.06)',
+              border: dragging ? `1.5px dashed ${drag.valid ? 'var(--teal)' : '#ff6a55'}` : editing ? '1.5px dashed rgba(255,255,255,.45)' : `1px solid rgba(255,255,255,${on ? .42 : .12})`,
+              boxShadow: on && !editing ? '0 18px 40px -22px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.2)' : 'none',
+              cursor: editing ? 'grab' : placing ? 'crosshair' : 'pointer', transition: dragging ? 'none' : 'left .3s, top .3s, width .3s, height .3s, background .25s, border-color .25s', touchAction: 'none' }}>
+            {/* label */}
+            <div style={{ position: 'absolute', left: 0, right: 0, top: room.block.h > 1 ? '42%' : '30%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, fontSize: 9, letterSpacing: '.14em', textTransform: 'uppercase', color: 'rgba(255,255,255,.5)', fontWeight: 500, padding: '0 10px', pointerEvents: 'none' }}>
+              <I size={12} strokeWidth={1.6} /><span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{room.name}</span>
+            </div>
+            {/* RFID stock chips */}
+            {!editing && (
+              <div style={{ position: 'absolute', left: 12, bottom: 10, display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start', pointerEvents: 'none' }}>
+                {chips.map(l => {
+                  const v = room.stock[l.k], lv = level(v), LI = l.icon
+                  return (
+                    <span key={l.k} className="chip" title={Array.isArray(v) ? `${v[0]} of ${v[1]} par` : `${v} tagged`}
+                      style={{ height: 22, fontSize: 10, padding: '0 9px', gap: 5,
+                        background: lv === 'low' ? 'rgba(216,67,47,.28)' : lv === 'mid' ? 'rgba(210,154,18,.28)' : 'rgba(255,255,255,.12)',
+                        color: lv === 'low' ? '#ffb4a6' : lv === 'mid' ? '#ffd98a' : 'rgba(255,255,255,.85)' }}>
+                      <LI size={10} />{countOf(v)} {l.unit}
+                    </span>
+                  )
+                })}
+              </div>
+            )}
+            {/* task status pin */}
+            {!editing && layers.tasks && st.open > 0 && (() => {
+              const c = STATUS_COLOR[st.status]
+              return (
+                <span onMouseEnter={() => setHover(room.id)} onMouseLeave={() => setHover(h => (h === room.id ? null : h))}
+                  style={{ position: 'absolute', left: '50%', top: room.block.h > 1 ? '30%' : 18, transform: 'translate(-50%, -50%)', width: 40, height: 40, borderRadius: '50%', background: `${c}44`, display: 'grid', placeItems: 'center', cursor: 'pointer', zIndex: 3 }}>
+                  {st.status === 'overdue' && <span style={{ position: 'absolute', inset: 0, borderRadius: '50%', background: `${c}44`, animation: 'ping 2s ease-out infinite' }} />}
+                  <span style={{ width: 22, height: 22, borderRadius: '50%', background: c, color: '#fff', fontSize: 10, display: 'grid', placeItems: 'center', boxShadow: on ? '0 0 0 2px #fff' : 'none' }}>!</span>
+                </span>
+              )
+            })()}
+            {/* comments badge */}
+            {!editing && layers.comments && roomNotes.length > 0 && (
+              <span title={`${roomNotes.length} note${roomNotes.length > 1 ? 's' : ''}`} style={{ position: 'absolute', right: 10, top: 10, minWidth: 18, height: 18, borderRadius: 9, background: '#3d7bd9', color: '#fff', fontSize: 9.5, display: 'grid', placeItems: 'center', padding: '0 5px', pointerEvents: 'none' }}>{roomNotes.length}</span>
+            )}
+            {/* edit controls */}
+            {editing && (
+              <>
+                <span style={{ position: 'absolute', left: 10, bottom: 8, fontSize: 9.5, opacity: .55, pointerEvents: 'none' }}>{room.block.w} × {room.block.h}</span>
+                <div style={{ position: 'absolute', right: 8, top: 8, display: 'flex', gap: 4 }}>
+                  <button title="Rename / change type" onPointerDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); setModal({ rename: room }) }}
+                    style={{ width: 24, height: 24, borderRadius: '50%', background: 'rgba(255,255,255,.2)', display: 'grid', placeItems: 'center' }}><Pencil size={11} /></button>
+                  <button title="Remove block" onPointerDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); removeBlock(room) }}
+                    style={{ width: 24, height: 24, borderRadius: '50%', background: 'rgba(216,67,47,.5)', display: 'grid', placeItems: 'center' }}><Trash2 size={11} /></button>
+                </div>
+                <span title="Drag to resize" onPointerDown={e => startDrag(e, room, 'resize')}
+                  style={{ position: 'absolute', right: -6, bottom: -6, width: 18, height: 18, borderRadius: '50%', background: '#fff', boxShadow: '0 2px 6px rgba(0,0,0,.4)', cursor: 'nwse-resize', zIndex: 2 }} />
+              </>
             )}
           </div>
         )
       })}
 
-      {floor === 'LG' && notes.map(n => {
-        const pos = at(n.x, n.y)
-        const style = { position: 'absolute', left: pos.left, top: pos.top - 17, transition: ease, pointerEvents: placing ? 'none' : 'auto' }
-        if (n.kind === 'voice') return <VoiceChip key={n.id} v={n} style={style} />
+      {/* "+ Add new block" tile in the first free cell */}
+      {addSlot && (
+        <button className="abs card-link" onClick={() => setModal('add')}
+          style={{ ...rectOf(addSlot), borderRadius: 18, border: '1px dashed rgba(255,255,255,.22)', background: 'rgba(255,255,255,.03)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, fontSize: 9, letterSpacing: '.14em', color: 'rgba(255,255,255,.55)', zIndex: 2 }}>
+          <Plus size={12} /> ADD NEW BLOCK
+        </button>
+      )}
+
+      {/* staff and notes, drawn on top of their blocks */}
+      {!editing && plan2.map(room => {
+        const rc = rectOf(room.block)
+        const at = (fx, fy) => ({ left: rc.left + fx * rc.width, top: rc.top + fy * rc.height })
         return (
-          <button key={n.id} onClick={tap(() => setOpenNote(n))} title={`${n.title} · ${staffById[n.by]?.name}`}
-            style={{ ...style, top: pos.top - 21, display: 'flex', alignItems: 'center', gap: 8, padding: 4, paddingRight: 14, borderRadius: 999, background: 'rgba(250,240,225,.92)', color: 'var(--ink)', maxWidth: 190 }}>
-            {n.photo ? <img src={n.photo} alt="" style={{ width: 34, height: 34, borderRadius: '50%', objectFit: 'cover' }} />
-              : <span style={{ width: 34, height: 34, borderRadius: '50%', background: '#f1d9a6', display: 'grid', placeItems: 'center' }}><StickyNote size={15} /></span>}
-            <span style={{ lineHeight: 1.1, textAlign: 'left', minWidth: 0 }}>
-              <div style={{ fontSize: 10, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{n.kind === 'photo' ? (n.count || 1) : n.title}</div>
-              <div style={{ fontSize: 9, color: 'var(--muted)' }}>{n.kind === 'photo' ? `photo${(n.count || 1) > 1 ? 's' : ''}` : 'note'}</div>
-            </span>
-          </button>
+          <div key={'o' + room.id} style={{ pointerEvents: placing ? 'none' : 'auto' }}>
+            {layers.staff && STAFF_PINS.filter(p => p.room === room.id).map(p => {
+              const s = staffById[p.staff], pos = at(p.fx, p.fy)
+              return (
+                <div key={p.staff} title={`${s.name} · ${s.note}`} className="abs" style={{ left: pos.left - 17, top: pos.top - 40, zIndex: 4, filter: 'drop-shadow(0 4px 6px rgba(0,0,0,.3))', transition: 'left .3s, top .3s' }}>
+                  <div style={{ position: 'absolute', left: 11, top: 27, width: 12, height: 12, background: ringColor(s.status), transform: 'rotate(45deg)', borderRadius: 2 }} />
+                  <Avatar id={p.staff} size={34} style={{ border: `3px solid ${ringColor(s.status)}`, position: 'relative' }} />
+                </div>
+              )
+            })}
+            {layers.comments && notes.filter(n => n.room === room.id).map(n => {
+              const pos = at(n.fx, n.fy)
+              const style = { position: 'absolute', left: pos.left, top: pos.top - 15, zIndex: 5, transition: 'left .3s, top .3s' }
+              if (n.kind === 'voice') return null
+              return (
+                <button key={n.id} onClick={() => setOpenNote(n)} title={`${n.title} · ${staffById[n.by]?.name}`}
+                  style={{ ...style, display: 'flex', alignItems: 'center', gap: 6, padding: 3, paddingRight: 11, borderRadius: 999, background: 'rgba(250,240,225,.92)', color: 'var(--ink)', maxWidth: 150 }}>
+                  {n.photo ? <img src={n.photo} alt="" style={{ width: 26, height: 26, borderRadius: '50%', objectFit: 'cover' }} />
+                    : <span style={{ width: 26, height: 26, borderRadius: '50%', background: '#f1d9a6', display: 'grid', placeItems: 'center' }}><StickyNote size={12} /></span>}
+                  <span style={{ fontSize: 9.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{n.kind === 'photo' ? `${n.count || 1} photos` : n.title}</span>
+                </button>
+              )
+            })}
+          </div>
         )
       })}
 
-      {draft && (() => { const pos = at(draft.x, draft.y); return (
-        <div style={{ position: 'absolute', left: pos.left - 16, top: pos.top - 40, transition: ease, pointerEvents: 'none', animation: 'rise .4s both' }}>
-          <MapPin size={36} fill="var(--teal)" color="#fff" strokeWidth={1.5} style={{ filter: 'drop-shadow(0 6px 8px rgba(0,0,0,.35))' }} />
+      {draft && (() => {
+        const room = plan.find(r => r.id === draft.room), rc = rectOf(room.block)
+        return <MapPin className="abs" size={30} fill="var(--teal)" color="#fff" strokeWidth={1.5}
+          style={{ left: rc.left + draft.fx * rc.width - 15, top: rc.top + draft.fy * rc.height - 30, zIndex: 6, filter: 'drop-shadow(0 6px 8px rgba(0,0,0,.35))' }} />
+      })()}
+
+      {/* hovering a pulsing blip previews that area's tasks */}
+      {hover && !editing && !placing && (() => {
+        const room = plan2.find(r => r.id === hover); if (!room) return null
+        const st = info[room.id], rc = rectOf(room.block)
+        const open = st.sum.list.filter(t => t.status !== 'done').sort((a, b) => ['overdue', 'soon', 'progress', 'pending'].indexOf(a.status) - ['overdue', 'soon', 'progress', 'pending'].indexOf(b.status))
+        const px = rc.left + rc.width / 2, py = rc.top + (room.block.h > 1 ? rc.height * 0.3 : 18)
+        const h = 62 + Math.min(4, open.length) * 34
+        const top = py - h - 26 < CONT.y - 40 ? py + 26 : py - h - 26
+        const left = Math.max(CONT.x + 8, Math.min(px - 130, CONT.x + CONT.w - 268))
+        return (
+          <div className="abs fade" style={{ left, top, width: 260, zIndex: 20, pointerEvents: 'none', borderRadius: 20, padding: '12px 14px', background: 'rgba(236,241,241,.94)', color: 'var(--ink)', boxShadow: '0 18px 40px -16px rgba(0,0,0,.55)' }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+              <span style={{ fontSize: 14, fontWeight: 500 }}>{room.name}</span>
+              <span style={{ fontSize: 10, color: STATUS_COLOR[st.status], fontWeight: 600, letterSpacing: '.06em' }}>{st.open} OPEN</span>
+            </div>
+            <div style={{ display: 'grid', gap: 6, marginTop: 8 }}>
+              {open.slice(0, 4).map(t => (
+                <div key={t.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                  <span className="dot" style={{ background: TASK_STATUS[t.status].color }} />
+                  <span style={{ flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
+                  <span style={{ fontSize: 10.5, color: 'var(--muted)', flex: 'none' }}>{t.people[0] ? staffById[t.people[0]].name.split(' ')[0] : 'Unassigned'} · {fmtTime(t.due)}</span>
+                </div>
+              ))}
+              {open.length > 4 && <div style={{ fontSize: 10.5, color: 'var(--muted)' }}>+{open.length - 4} more — click the block</div>}
+            </div>
+          </div>
+        )
+      })()}
+
+      {/* Predictive restock */}
+      {restock && !editing && (
+        <div className="abs rise" style={{ left: GRID.x, top: 762, width: GRID.w, height: 62, borderRadius: 22, background: 'rgba(190,170,90,.28)', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)', display: 'flex', alignItems: 'center', gap: 14, padding: '0 14px 0 12px', zIndex: 7 }}>
+          <span style={{ width: 38, height: 38, borderRadius: '50%', background: 'rgba(229,180,60,.45)', display: 'grid', placeItems: 'center', flex: 'none' }}><Sparkles size={16} color="#ffe6a3" /></span>
+          <span style={{ flex: 1, lineHeight: 1.35, minWidth: 0 }}>
+            <div style={{ fontSize: 12, color: '#ffd98a', fontWeight: 600 }}>Predictive restock.</div>
+            <div style={{ fontSize: 11.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {restock.room.name} {restock.k} are at {restock.n} of {restock.par}. At today’s booking rate they run out by 13:20.{restock.src ? ` ${restock.src.name} has stock ready.` : ''}
+            </div>
+          </span>
+          {role === 'manager' && (restockDone
+            ? <span className="chip" style={{ background: 'rgba(255,255,255,.18)', height: 30, fontSize: 11.5, padding: '0 12px' }}><Check size={12} /> Restock task created</span>
+            : <button className="pill-btn white" style={{ height: 34, fontSize: 12 }} onClick={createRestock}>Create restock task</button>)}
         </div>
-      ) })()}
-
-      {selPin && floor === 'LG' && filters[selPin.status] && !placing &&
-        <PinCard pin={selPin} pos={at(selPin.x, selPin.y)} ease={ease} onClose={() => setSel(null)} onTask={editTask}
-          onLocation={() => nav(`/${role}/rooms?floor=LG`)} />}
-      <div style={{ position: 'absolute', left: 0, right: 0, top: 0, height: 120, pointerEvents: 'none', background: 'linear-gradient(rgba(30,62,68,.55), rgba(30,62,68,0))' }} />
-      {floor !== 'LG' && <div className="glass" style={{ position: 'absolute', left: 340, top: 360, padding: '22px 28px', textAlign: 'center' }}>No live plan uploaded for {floor} yet.<div style={{ fontSize: 12, opacity: .7, marginTop: 6 }}>Rooms on {floor} are still tracked in the Location view.</div></div>}
-    </div>
-  )
-
-  return (
-    <Page view="map" bg="dark" nav={false} under={mapLayer}>
-      {/* filter chips */}
-      <div className="abs" style={{ left: 40, top: 122, display: 'flex', gap: 8, zIndex: 12 }}>
-        <Drop label={floor} open={menu === 'floor'} onToggle={() => setMenu(menu === 'floor' ? null : 'floor')}
-          items={['LG', 'L1', 'L2']} value={floor} onPick={v => { setFloor(v); setMenu(null) }} />
-        <Drop label={showStaff ? 'All staff' : 'No staff'} open={menu === 'staff'} onToggle={() => setMenu(menu === 'staff' ? null : 'staff')}
-          items={['All staff', 'No staff']} value={showStaff ? 'All staff' : 'No staff'} onPick={v => { setShowStaff(v === 'All staff'); setMenu(null) }} />
-        <Drop label="All rooms" open={menu === 'rooms'} onToggle={() => setMenu(menu === 'rooms' ? null : 'rooms')}
-          items={pins.map(p => p.room.name)} onPick={v => { focusPin(pins.find(p => p.room.name === v)); setMenu(null) }} />
-        {[['overdue', 'Overdue', '#d8321f', 'rgba(150,40,30,.35)', '#ff4a35'], ['soon', 'Due soon', '#e3b02b', 'rgba(200,160,60,.4)', '#ffcd4a'], ['ontrack', 'On track', '#0f8a76', 'rgba(20,110,95,.35)', '#18c4a5']].map(([key, label, c, bg, text]) => (
-          <button key={key} onClick={() => setFilters(f => ({ ...f, [key]: !f[key] }))} className="chip float"
-            style={{ height: 34, padding: '0 14px', fontSize: 13, background: bg, color: text, opacity: filters[key] ? 1 : .4, gap: 8, transition: 'opacity .2s' }}>
-            <span className="dot" style={{ background: c }} />{label}
-          </button>
-        ))}
-      </div>
+      )}
+      {editing && (
+        <div className="abs fade" style={{ left: GRID.x, top: 762, width: GRID.w, height: 62, borderRadius: 22, background: 'rgba(255,255,255,.1)', display: 'flex', alignItems: 'center', gap: 12, padding: '0 18px', fontSize: 12, zIndex: 7 }}>
+          <Pencil size={14} /> <span style={{ flex: 1 }}>Build your spa plan: drag a block to move it, drag its white corner to resize, ✎ to rename, 🗑 to remove. Each block is a room on the Location page.</span>
+          <button className="pill-btn teal" style={{ height: 34, fontSize: 12 }} onClick={() => setEditing(false)}><Check size={13} /> Done</button>
+        </div>
+      )}
 
       {placing && (
         <div className="abs rise float" style={{ left: '50%', top: 98, transform: 'translateX(-50%)', zIndex: 25, display: 'flex', alignItems: 'center', gap: 12, padding: '8px 8px 8px 18px', borderRadius: 999, background: 'rgba(12,45,50,.75)', boxShadow: '0 12px 30px -10px rgba(0,0,0,.4)' }}>
           <MapPin size={16} color="var(--teal)" />
-          <span style={{ fontSize: 13 }}>Tap anywhere on the plan to drop your note</span>
+          <span style={{ fontSize: 13 }}>Tap a block to drop your note there</span>
           <button className="pill-btn white" style={{ height: 32, fontSize: 12 }} onClick={() => setPlacing(false)}>Cancel</button>
         </div>
       )}
 
-      {/* zoom */}
-      <div className="abs" style={{ left: 40, top: 795, display: 'flex', gap: 6, zIndex: 12 }}>
-        <button className="circle-btn" style={{ width: 42, height: 42 }} onClick={() => zoomTo(+(view.z - 0.2).toFixed(1))}><Minus size={14} /></button>
-        <button className="pill-btn ghost" style={{ height: 42, width: 76, justifyContent: 'center', fontSize: 14 }} onClick={() => setView({ z: 1, ...START })} title="Reset view">{Math.round(view.z * 100)}%</button>
-        <button className="circle-btn" style={{ width: 42, height: 42 }} onClick={() => zoomTo(+(view.z + 0.2).toFixed(1))}><Plus size={14} /></button>
-      </div>
+      {/* right column */}
+      <AreaCard room={selRoom} info={selRoom && info[selRoom.id]} onTask={editTask} onLocation={() => nav(`/${role}/rooms?floor=LG`)} />
 
-      {/* right panel */}
-      <div className="glass abs rise" style={{ left: 1121, top: 128, width: 347, height: 167, padding: '18px 16px', background: 'rgba(255,255,255,.2)' }}>
-        <div style={{ display: 'flex' }}>
-          <div style={{ flex: 1, fontSize: 16, color: 'var(--teal)' }}>Needs attention</div>
-          <span style={{ width: 22, height: 22, borderRadius: '50%', background: 'rgba(60,198,181,.25)', color: 'var(--teal)', fontSize: 10, display: 'grid', placeItems: 'center' }}>{attention.length}</span>
-        </div>
-        <div style={{ fontSize: 9.5, color: 'var(--teal)', marginTop: 2, opacity: .9 }}>{attention.length} rooms overdue · 1 blocked{attention.length > 2 ? ` · showing 2 of ${attention.length}` : ''}</div>
-        <div style={{ marginTop: 8, display: 'grid', gap: 4 }}>
-          {attention.slice(0, 2).map(p => (
-            <button key={p.room.id} onClick={() => focusPin(p)} style={{ textAlign: 'left', fontSize: 11.5 }}>
-              {p.room.name} · {p.sum.list.find(t => t.status === 'overdue')?.title.toLowerCase()} · due {p.sum.list.find(t => t.status === 'overdue')?.due}
-            </button>
-          ))}
-          {!attention.length && <div style={{ fontSize: 11.5, opacity: .8 }}>All rooms on track 🎉</div>}
-        </div>
-        <button className="pill-btn teal" style={{ position: 'absolute', left: 16, bottom: 16, height: 32, fontSize: 11, padding: '0 14px' }} onClick={() => nav(`/${role}/rooms`)}>Open rooms <ArrowUpRight size={14} /></button>
-      </div>
-
-      <div className="glass abs rise" style={{ left: 1125, top: 310, width: 165, height: 165, padding: '16px 14px', animationDelay: '60ms' }}>
+      <div className="glass abs rise" style={{ left: 1112, top: 572, width: 166, height: 166, padding: '16px 14px', animationDelay: '60ms' }}>
         <div style={{ fontSize: 13 }}>Completion rate</div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12 }}>
           <span style={{ fontSize: 30, fontWeight: 300 }}>{Math.round((done / all) * 100)}%</span>
@@ -247,68 +370,125 @@ export default function FloorMap() {
         <div style={{ fontSize: 9, marginTop: 14, lineHeight: 1.45, opacity: .85 }}>{all - done} remaining<br />{stats.overdue} overdue{role === 'manager' && ' · 1 blocked'}</div>
         <button onClick={() => nav(`/${role}/tasks`)} style={{ fontSize: 10, marginTop: 8, display: 'flex', alignItems: 'center', gap: 4 }}>View progress <ArrowRight size={11} /></button>
       </div>
+      <div className="glass abs rise" style={{ left: 1286, top: 572, width: 166, height: 166, padding: '16px 14px', animationDelay: '90ms' }}>
+        <div style={{ fontSize: 13 }}>Staff on shift</div>
+        <div style={{ display: 'flex', alignItems: 'center', marginTop: 12 }}>
+          <span style={{ fontSize: 30, fontWeight: 300, flex: 1 }}>12</span>
+          <span style={{ fontSize: 8, textAlign: 'right' }}><span style={{ color: '#7ee0a0' }}>●</span> live<br />On shift</span>
+        </div>
+        <div style={{ fontSize: 9, lineHeight: 1.45, marginTop: 4 }}>
+          {STAFF.filter(s => s.status === 'busy').length + 5} <span style={{ opacity: .6 }}>working ·</span> 3 <span style={{ opacity: .6 }}>available</span><br />{STAFF.filter(s => s.status === 'break').length - 1} <span style={{ opacity: .6 }}>on break</span>
+        </div>
+        <div style={{ marginTop: 8 }}><AvatarStack ids={['elena', 'sofia', 'lucas']} size={30} max={2} extra={10} /></div>
+      </div>
+      <NotesStrip notes={notes} onOpen={setOpenNote} onAdd={() => { setPlacing(true); setEditing(false) }} />
 
-      {role === 'manager' ? (
-        <>
-          <div className="glass abs rise" style={{ left: 1298, top: 310, width: 165, height: 165, padding: '16px 14px', animationDelay: '90ms' }}>
-            <div style={{ fontSize: 13 }}>Staff on shift</div>
-            <div style={{ display: 'flex', alignItems: 'center', marginTop: 12 }}>
-              <span style={{ fontSize: 30, fontWeight: 300, flex: 1 }}>12</span>
-              <span style={{ fontSize: 8, textAlign: 'right' }}><span style={{ color: '#7ee0a0' }}>●</span> live<br />On shift</span>
-            </div>
-            <div style={{ fontSize: 9, lineHeight: 1.45, marginTop: 4 }}>
-              {STAFF.filter(s => s.status === 'busy').length + 5} <span style={{ opacity: .6 }}>working ·</span> 3 <span style={{ opacity: .6 }}>available</span><br />{STAFF.filter(s => s.status === 'break').length - 1} <span style={{ opacity: .6 }}>on break</span>
-            </div>
-            <div style={{ marginTop: 8 }}><AvatarStack ids={['elena', 'sofia', 'lucas']} size={30} max={2} extra={10} /></div>
-          </div>
-          <VoiceCard notes={notes} style={{ left: 1298, top: 490 }} />
-          <NoteCard notes={notes} style={{ left: 1125, top: 490 }} onOpen={setOpenNote} onAdd={startPlacing} />
-          <AddNote style={{ left: 1125, top: 668 }} onClick={startPlacing} active={placing} />
-          <div className="glass soft abs rise" style={{ left: 1298, top: 668, width: 165, height: 165, padding: 16, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, placeItems: 'center', animationDelay: '200ms' }}>
-            <button className="card-link" title="Assign tasks in Location" onClick={() => nav('/manager/rooms')} style={{ width: 58, height: 58, borderRadius: '50%', background: 'rgba(255,255,255,.12)', display: 'grid', placeItems: 'center' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 3 }}>{['elena', 'daniel', 'marcus', 'sofia'].map(id => <Avatar key={id} id={id} size={20} />)}</div>
-            </button>
-            <QA title="Task list" onClick={() => nav('/manager/tasks')}><ClipboardList size={20} strokeWidth={1.5} /></QA>
-            <QA title="Drop a note" onClick={startPlacing}><PenLine size={19} strokeWidth={1.5} /></QA>
-            <QA title="Assistant" onClick={() => setAssistantOpen(true)}><MessageCircle size={19} strokeWidth={1.5} /></QA>
-          </div>
-        </>
-      ) : (
-        <>
-          <VoiceCard notes={notes} style={{ left: 1306, top: 310 }} />
-          <NoteCard notes={notes} style={{ left: 1130, top: 490 }} onOpen={setOpenNote} onAdd={startPlacing} />
-          <AddNote style={{ left: 1310, top: 490 }} onClick={startPlacing} active={placing} />
-        </>
-      )}
-
-      {draft && <NoteModal where={nearestRoom(draft.x, draft.y)?.name || 'LG'} onClose={() => setDraft(null)}
+      {draft && <NoteModal where={draft.where} onClose={() => setDraft(null)}
         onSave={n => {
-          dispatch({ type: 'addNote', note: { id: 'n' + Date.now(), x: draft.x, y: draft.y, by: role === 'manager' ? 'elena' : 'amy', when: 'just now', ...n } })
-          setDraft(null); notify(`${n.kind === 'voice' ? 'Voice' : n.kind === 'photo' ? 'Photo' : 'Text'} note pinned at ${n.where}`)
+          dispatch({ type: 'addNote', note: { id: 'n' + Date.now(), room: draft.room, fx: Math.min(.8, Math.max(.05, draft.fx)), fy: Math.min(.85, Math.max(.15, draft.fy)), by: role === 'manager' ? 'elena' : 'amy', when: 'just now', ...n } })
+          setDraft(null); notify(`${n.kind === 'voice' ? 'Voice' : n.kind === 'photo' ? 'Photo' : 'Text'} note pinned in ${n.where}`)
         }} />}
-      {openNote && <NoteView note={openNote} onClose={() => setOpenNote(null)} onFocus={() => { setOpenNote(null); setView(v => { const z = Math.max(v.z, 1.3); return clamp({ z, x: FOCUS.x - openNote.x * BASE * z, y: FOCUS.y - openNote.y * BASE * z }) }) }} />}
+      {openNote && <NoteView note={openNote} onClose={() => setOpenNote(null)} onFocus={() => { setSel(openNote.room); setOpenNote(null) }} />}
       {editor && <TaskEditor {...editor} onClose={() => setEditor(null)} />}
+      {modal === 'add' && (
+        <FormModal title="Add a block" submit="Add to plan" onClose={() => setModal(null)}
+          fields={[
+            { name: 'name', label: 'Room name', placeholder: 'e.g. Treatment Room 5', required: true },
+            { name: 'type', label: 'Type', options: TYPES.map(t => t[0]) },
+            { name: 'size', label: 'Size on the plan', options: Object.keys(SIZES) },
+          ]}
+          onSubmit={v => {
+            const [w, h] = SIZES[v.size], spot = freeCell(plan, w, h)
+            if (!spot) return notify(`No free ${v.size} space — resize or remove a block first`)
+            const id = 'r' + Date.now()
+            dispatch({ type: 'addRoom', room: { id, name: v.name.trim(), type: TYPES.find(t => t[0] === v.type)[1], floor: 'LG', block: spot, stock: {} } })
+            setModal(null); setSel(id); notify(`${v.name} added — it’s on the Location page too`)
+          }} />
+      )}
+      {modal?.rename && (
+        <FormModal title={`Edit ${modal.rename.name}`} submit="Save block" onClose={() => setModal(null)}
+          fields={[
+            { name: 'name', label: 'Room name', value: modal.rename.name, required: true },
+            { name: 'type', label: 'Type', options: TYPES.map(t => t[0]), value: (TYPES.find(t => t[1] === modal.rename.type) || TYPES[0])[0] },
+          ]}
+          onSubmit={v => {
+            dispatch({ type: 'updateRoom', room: { id: modal.rename.id, name: v.name.trim(), type: TYPES.find(t => t[0] === v.type)[1] } })
+            setModal(null); notify('Block updated')
+          }} />
+      )}
     </Page>
   )
 }
 
-const QA = ({ children, onClick, title }) => (
-  <button className="card-link" title={title} onClick={onClick} style={{ width: 58, height: 58, borderRadius: '50%', background: 'rgba(255,255,255,.12)', display: 'grid', placeItems: 'center' }}>{children}</button>
-)
-
-function Drop({ label, open, onToggle, items, value, onPick }) {
+/** Selected area: its RFID stock and the tasks in it (right column, top) */
+function AreaCard({ room, info, onTask, onLocation }) {
+  const box = { left: 1112, top: 196, width: 340, height: 360 }
+  if (!room) return (
+    <div className="glass abs rise" style={{ ...box, display: 'grid', placeItems: 'center', textAlign: 'center' }}>
+      <div><LayoutGrid size={22} style={{ opacity: .6 }} /><div style={{ fontSize: 13, marginTop: 10, opacity: .8 }}>Tap a block to see its RFID stock and tasks</div></div>
+    </div>
+  )
+  const rows = [
+    ['towels', 'Towels', Layers], ['robes', 'Robes', Shirt], ['products', 'Products', Package],
+    ['guests', 'Guests', User], ['equipment', 'Equipment', Wrench],
+  ].filter(([k]) => room.stock?.[k] != null)
+  const staffHere = STAFF_PINS.filter(p => p.room === room.id).length
+  const order = ['overdue', 'soon', 'progress', 'pending', 'done']
+  const list = [...(info?.sum.list || [])].sort((a, b) => order.indexOf(a.status) - order.indexOf(b.status))
   return (
-    <div style={{ position: 'relative' }}>
-      <button className="chip float" onClick={onToggle} style={{ height: 34, padding: '0 14px', fontSize: 13, background: 'rgba(255,255,255,.22)', gap: 6 }}>{label} <ChevronDown size={11} /></button>
-      {open && (
-        <div className="paper rise scroll" style={{ position: 'absolute', top: 40, left: 0, minWidth: 180, maxHeight: 380, padding: 6, borderRadius: 16, zIndex: 20 }}>
-          {items.map(i => (
-            <button key={i} onClick={() => onPick(i)} style={{ display: 'flex', width: '100%', padding: '8px 12px', borderRadius: 10, fontSize: 12.5, background: i === value ? '#e5eded' : 'transparent', textAlign: 'left' }}>
-              <span style={{ flex: 1 }}>{i}</span>{i === value && <Check size={13} />}
-            </button>
-          ))}
-        </div>
+    <div key={room.id} className="glass abs rise" style={{ ...box, padding: '20px 18px 14px', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+        <span style={{ fontSize: 22, letterSpacing: '-.01em', flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{room.name}</span>
+        <span className={`tag ${room.type}`}>{tagLabel(room.type)}</span>
+      </div>
+
+      <div style={{ fontSize: 9.5, letterSpacing: '.14em', opacity: .5, marginTop: 12 }}>RFID TAGS</div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 14px', marginTop: 8 }}>
+        {[...rows, ['staff', 'Staff', Contact]].map(([k, label, I]) => {
+          const v = k === 'staff' ? staffHere : room.stock[k], lv = level(v)
+          return (
+            <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 12 }}>
+              <I size={13} style={{ opacity: .7 }} /><span style={{ flex: 1, opacity: .85 }}>{label}</span>
+              <b style={{ fontWeight: 600, color: lv === 'low' ? '#ffb4a6' : lv === 'mid' ? '#ffd98a' : '#fff' }}>{countOf(v)}</b>
+              {Array.isArray(v) && <span style={{ fontSize: 9.5, opacity: .5, marginLeft: -3 }}>/{v[1]}</span>}
+            </div>
+          )
+        })}
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', marginTop: 14 }}>
+        <span style={{ fontSize: 9.5, letterSpacing: '.14em', opacity: .5, flex: 1 }}>TASKS IN THIS AREA</span>
+        <span style={{ fontSize: 10, opacity: .7 }}>{info?.open || 0} open / {list.length}</span>
+      </div>
+      <div className="scroll" style={{ marginTop: 8, display: 'grid', gap: 5, flex: 1, alignContent: 'start', paddingRight: 2 }}>
+        {list.map(t => <TaskChip key={t.id} t={t} onClick={onTask} />)}
+        {!list.length && <div style={{ fontSize: 12, opacity: .7, padding: '10px 2px' }}>No tasks in {room.name} right now.</div>}
+      </div>
+      <button onClick={onLocation} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10.5, opacity: .8, marginTop: 8, alignSelf: 'flex-end' }}><LayoutGrid size={11} /> Location view</button>
+    </div>
+  )
+}
+
+/** Notes pinned on the plan: latest photo, voice notes to play, and + to drop a new one */
+function NotesStrip({ notes, onOpen, onAdd }) {
+  const photo = notes.find(n => n.kind !== 'voice')
+  const voice = notes.filter(n => n.kind === 'voice')
+  return (
+    <div className="glass abs rise" style={{ left: 1112, top: 754, width: 340, height: 82, padding: '10px 10px 10px 12px', display: 'flex', alignItems: 'center', gap: 10, animationDelay: '120ms' }}>
+      {photo && (
+        <button onClick={() => onOpen(photo)} title={photo.title} style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flex: 'none', width: 120, textAlign: 'left' }}>
+          {photo.photo ? <img src={photo.photo} alt="" style={{ width: 48, height: 48, borderRadius: 12, objectFit: 'cover', flex: 'none' }} />
+            : <span style={{ width: 48, height: 48, borderRadius: 12, background: 'rgba(255,255,255,.15)', display: 'grid', placeItems: 'center' }}><StickyNote size={16} /></span>}
+          <span style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 11, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{photo.title}</div>
+            <div style={{ fontSize: 9, opacity: .6 }}>{photo.where}</div>
+          </span>
+        </button>
       )}
+      <div style={{ display: 'grid', gap: 4, flex: 1, minWidth: 0 }}>
+        {voice.slice(0, 2).map((v, i) => <VoiceChip key={v.id} v={{ ...v, wave: i === 0 }} onDark style={{ height: 30 }} />)}
+      </div>
+      <button onClick={onAdd} title="Drop a note on the plan" style={{ width: 40, height: 40, borderRadius: '50%', background: 'rgba(255,255,255,.2)', display: 'grid', placeItems: 'center', flex: 'none' }}><Plus size={16} /></button>
     </div>
   )
 }
@@ -318,10 +498,7 @@ function PinCard({ pin, pos, ease, onClose, onTask, onLocation }) {
   const overdue = sum.list.filter(t => t.status === 'overdue')
   const open = sum.list.filter(t => t.status !== 'done')
   const shown = [...open].sort((a, b) => (a.status === 'overdue' ? -1 : 0) - (b.status === 'overdue' ? -1 : 0)).slice(0, 3)
-  // keep the card inside the open map area (left of the side panel, below the filter chips)
-  const h = 150 + shown.length * 48
-  const left = Math.max(20, Math.min(pos.left - 30, 1100 - 270))
-  const top = Math.max(170, Math.min(pos.top > 470 ? pos.top - h - 30 : pos.top + 34, 860 - h))
+  const { left, top } = pos // already placed beside its block by the map
   return (
     <div className="rise" onPointerDown={e => e.stopPropagation()} onPointerUp={e => e.stopPropagation()}
       style={{ position: 'absolute', left, top, transition: ease, width: 270, padding: '18px 16px 14px', borderRadius: 26, background: 'rgba(205, 212, 210, .78)', backdropFilter: 'blur(18px)', WebkitBackdropFilter: 'blur(18px)', color: 'var(--ink)', boxShadow: '0 20px 40px -18px rgba(0,0,0,.5)', cursor: 'default', zIndex: 5 }}>
@@ -414,16 +591,6 @@ function NoteCard({ notes, style, onOpen, onAdd }) {
         <ArrowRight size={13} />
       </div>
     </div>
-  )
-}
-
-function AddNote({ style, onClick, active }) {
-  return (
-    <button className="glass soft abs rise card-link" onClick={onClick} style={{ width: 165, height: 165, textAlign: 'center', animationDelay: '180ms', boxShadow: active ? '0 0 0 2px var(--teal)' : undefined, ...style }}>
-      {active ? <MapPin size={20} color="var(--teal)" /> : <Plus size={18} strokeWidth={1.5} />}
-      <div style={{ fontSize: 11.5, marginTop: 10 }}>{active ? 'Tap the plan…' : 'Add note'}</div>
-      <div style={{ fontSize: 7.5, opacity: .45, marginTop: 10, lineHeight: 1.4 }}>drop a pin, then add a<br />photo, voice or text note</div>
-    </button>
   )
 }
 

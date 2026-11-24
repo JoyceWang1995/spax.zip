@@ -49,7 +49,8 @@ export default function Rooms() {
 
   const list = useMemo(() => rooms.filter(r =>
     !r.hidden && r.floor === floor && (role === 'staff' || !r.staffOnly) &&
-    (type === 'All rooms' || r.type === type.toLowerCase())), [rooms, floor, type, role])
+    (type === 'All rooms' || r.type === type.toLowerCase()))
+    .sort((a, b) => a.block && b.block ? (a.block.r - b.block.r) || (a.block.c - b.block.c) : 0), [rooms, floor, type, role])
   const cards = role === 'manager' ? [{ create: true }, ...list] : list
   const pages = Math.max(1, Math.ceil(cards.length / 8))
   const pg = Math.min(page, pages - 1)
@@ -76,7 +77,7 @@ export default function Rooms() {
         {cards.slice(pg * 8, pg * 8 + 8).map((r, i) => (
           <div key={r.id || 'create'} className="widget rise" data-room-id={r.create ? undefined : r.id}
             style={{ animationDelay: `${i * 45}ms`, borderRadius: 30, transition: 'transform .2s, box-shadow .2s',
-              transform: drag?.over === r.id ? 'scale(1.04)' : 'none', boxShadow: drag?.over === r.id ? '0 0 0 3px var(--teal), 0 0 30px rgba(60,198,181,.5)' : 'none' }}>
+              transform: drag?.over && drag.over === r.id ? 'scale(1.04)' : 'none', boxShadow: drag?.over && drag.over === r.id ? '0 0 0 3px var(--teal), 0 0 30px rgba(60,198,181,.5)' : 'none' }}>
             {r.create ? <CreateRoom onClick={() => setModal(true)} />
               : <RoomCard room={r} tasks={tasks} onOpen={() => setOpen(r)} onTask={editTask} />}
           </div>
@@ -293,8 +294,8 @@ function RoomDetail({ room, onClose, onTask }) {
             </div>
           ))}
         </div>
-        <button className="pill-btn dark" style={{ marginTop: 18, justifyContent: 'center', height: 46 }} onClick={() => nav(`/${role}/map?room=${room.id}`)} disabled={!room.pin}>
-          <MapPin size={15} /> {room.pin ? 'Show on floor map' : `No plan for ${room.floor} yet`} <ArrowRight size={15} />
+        <button className="pill-btn dark" style={{ marginTop: 18, justifyContent: 'center', height: 46 }} onClick={() => nav(`/${role}/map?room=${room.id}`)} disabled={!room.block}>
+          <MapPin size={15} /> {room.block ? 'Show on the plan' : `No plan for ${room.floor} yet`} <ArrowRight size={15} />
         </button>
       </div>
     </>

@@ -14,7 +14,6 @@ import meStaff from '../assets/me-staff.jpg'
 import leader from '../assets/leader-elena.jpg'
 import portraitManager from '../assets/portrait-manager.jpg'
 import portraitStaff from '../assets/portrait-staff.jpg'
-import floorplan from '../assets/floorplan.webp'
 import plantRoom from '../assets/plant-room.jpg'
 import productCleanser from '../assets/product-cleanser.png'
 import productCream from '../assets/product-marine-cream.png'
@@ -30,7 +29,7 @@ import trSound from '../assets/train-sound-bath.jpg'
 export const img = {
   staff: { elena, lisa, marcus, sofia, daniel, maya, amara, lucas, chloe },
   meManager, meStaff, leader, portraitManager, portraitStaff,
-  floorplan, plantRoom,
+  plantRoom,
   products: { cleanser: productCleanser, cream: productCream, pads: productPads, eyeSerum: productEyeSerum },
   training: {
     deep: trDeep, scent: trScent, setup: trSetup, stone: trStone, arrival: trArrival, sound: trSound,
